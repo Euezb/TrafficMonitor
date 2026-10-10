@@ -1,8 +1,6 @@
 name: Build Lite (x64)
 
 # 只在推送 v* 标签或手动触发时构建。
-# 说明：原工作流在任意 push 时都会用 Release 配置构建标准版（三个平台各跑一遍），
-# 这里改为只构建 x64 的 Lite 版，避免产生无关的标准版产物。
 on:
   push:
     tags: ['v*']
@@ -11,7 +9,13 @@ on:
 jobs:
 
   x64_lite_build:
-    runs-on: windows-latest
+    # 两个镜像并行尝试：windows-latest 上 vswhere 报称有 ATLMFC 但库文件实际缺失，
+    # 所以这里不信任组件登记，直接检查 atlmfc\lib\x64 是否存在，缺了就现场安装。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-2022]
+    runs-on: ${{ matrix.os }}
 
     steps:
     - uses: actions/checkout@v4
@@ -19,53 +23,53 @@ jobs:
     - name: Add msbuild to PATH
       uses: microsoft/setup-msbuild@v2
 
-    # 镜像里同时有 VS 18(2026) 和 VS 2022(17.x)：前者没有安装 MFC 库，直接用会报
-    # MSB8041。这里用 vswhere 显式挑选带 VC.ATLMFC 组件的那套 MSBuild。
-    # 同时把关键环境信息写成 annotation（annotation 匿名可见，便于离线排查）。
-    - name: Resolve msbuild (prefer the install that has MFC)
+    - name: Resolve toolset and make sure MFC libraries really exist
       shell: pwsh
       run: |
         function Esc([string]$s) { return $s.Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A') }
-        $diag = [System.Collections.Generic.List[string]]::new()
-        $diag.Add('## 构建环境诊断')
+        function Test-Mfc([string]$install) {
+          $tools = Join-Path $install 'VC\Tools\MSVC'
+          if (-not (Test-Path $tools)) { return $false }
+          foreach ($d in Get-ChildItem $tools -Directory -ErrorAction SilentlyContinue) {
+            if (Test-Path (Join-Path $d.FullName 'atlmfc\lib\x64')) { return $true }
+          }
+          return $false
+        }
+
         $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-        $diag.Add("- vswhere: $vswhere (存在: $(Test-Path $vswhere))")
+        $installs = @(& $vswhere -products * -property installationPath) | Where-Object { $_ }
+        Write-Host ("::notice title=镜像::" + (Esc "$env:RUNNER_OS / $env:ImageOS"))
+        Write-Host ("::notice title=VS 安装列表::" + (Esc ($installs -join ' | ')))
 
-        $msbuild = $null
-        $withMfc = @()
-        if (Test-Path $vswhere) {
-          $withMfc = @(& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.ATLMFC -property installationPath)
-          $diag.Add("- 装有 MFC(ATLMFC) 的 VS 安装: " + $(if ($withMfc.Count) { $withMfc -join ' | ' } else { '(无)' }))
-          $msbuild = (& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.ATLMFC -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1)
-          $diag.Add("- 解析出的 msbuild: $msbuild (存在: $(Test-Path $msbuild))")
+        $chosen = $null
+        foreach ($p in $installs) {
+          $has = Test-Mfc $p
+          Write-Host ("::notice title=VS 安装::" + (Esc "$p  真实存在MFC库=$has"))
+          if ($has -and -not $chosen) { $chosen = $p }
         }
 
-        if (-not $msbuild -or -not (Test-Path $msbuild)) {
-          $cmd = Get-Command msbuild -ErrorAction SilentlyContinue
-          $diag.Add("- 回退到 PATH 中的 msbuild: " + $(if ($cmd) { $cmd.Source } else { '(没有找到)' }))
-          if ($cmd) { $msbuild = $cmd.Source }
+        if (-not $chosen) {
+          $chosen = (& $vswhere -latest -products * -property installationPath | Select-Object -First 1)
+          Write-Host ("::notice title=需要安装 MFC::" + (Esc "$chosen"))
+          $setup = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\setup.exe'
+          Write-Host ("::notice title=安装器::" + (Esc "setup.exe 存在=$(Test-Path $setup)"))
+          if (Test-Path $setup) {
+            & $setup modify --installPath "$chosen" --add Microsoft.VisualStudio.Component.VC.ATLMFC --quiet --norestart
+            Write-Host ("::notice title=安装器返回::" + (Esc "exit=$LASTEXITCODE，开始等待库文件出现"))
+            $deadline = (Get-Date).AddMinutes(12)
+            while ((Get-Date) -lt $deadline -and -not (Test-Mfc $chosen)) { Start-Sleep -Seconds 20 }
+          }
+          $ok = Test-Mfc $chosen
+          Write-Host ("::notice title=MFC 安装结果::" + (Esc "install=$chosen 现在有MFC库=$ok"))
+          if (-not $ok) { Write-Host ("::error title=MFC 仍然缺失::" + (Esc "$chosen")); exit 1 }
         }
 
-        $ver = ''
-        if ($msbuild -and (Test-Path $msbuild)) {
-          $ver = ((& $msbuild -version -nologo) -join ' ')
-          $diag.Add("- msbuild 版本: $ver")
-        }
-        $diag.Add("- 解决方案文件存在: $(Test-Path TrafficMonitor.sln)")
-        $diag.Add("- 主工程文件存在: $(Test-Path TrafficMonitor\TrafficMonitor.vcxproj)")
-
-        $diag | ForEach-Object { Write-Host $_ }
-        $diag | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
-
-        $mfcText = if ($withMfc.Count) { $withMfc -join ' | ' } else { '无' }
-        Write-Host ("::notice title=MSBuild 路径::" + (Esc "$msbuild"))
-        Write-Host ("::notice title=MSBuild 版本::" + (Esc "$ver"))
-        Write-Host ("::notice title=含 MFC 的 VS 安装::" + (Esc "$mfcText"))
-
+        $msbuild = Join-Path $chosen 'MSBuild\Current\Bin\MSBuild.exe'
+        Write-Host ("::notice title=选定 msbuild::" + (Esc $msbuild))
+        $ver = ((& $msbuild -version -nologo) -join ' ')
+        Write-Host ("::notice title=msbuild 版本::" + (Esc "$ver"))
         "MSBUILD_PATH=$msbuild" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
-    # 策略 1 用解决方案（与上游成功的构建方式一致，只构建主工程）；
-    # 若失败再用策略 2 直接构建 vcxproj 并显式指定 OutDir。
     - name: Run msbuild
       shell: pwsh
       run: |
@@ -90,7 +94,6 @@ jobs:
 
         if ($code -ne 0) { exit $code }
 
-    # annotation 是匿名可见的，把关键报错行发成 annotation，便于在不登录的情况下定位问题。
     - name: Publish build log (only on failure)
       if: failure()
       shell: pwsh
@@ -118,7 +121,7 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: TrafficMonitor-x64-lite
+        name: TrafficMonitor-x64-lite-${{ matrix.os }}
         if-no-files-found: error
         path: |
           Bin/x64/Release (lite)/TrafficMonitor.exe
