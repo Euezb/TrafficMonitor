@@ -385,17 +385,29 @@ void CTrafficMonitorDlg::AutoSelect()
 void CTrafficMonitorDlg::IniConnection()
 {
     //为m_pIfTable开辟所需大小的内存
+    //注意：GetIfTable 第一次调用得到的所需大小，到第二次调用时可能又不够用了
+    //（例如从休眠恢复、网卡增减时网卡表正在变化）。因此这里必须循环重试直到成功，
+    //否则 m_pIfTable 的实际容量会小于 dwNumEntries，后续按 dwNumEntries 遍历会越界并破坏堆。
     free(m_pIfTable);
+    m_pIfTable = nullptr;
     m_dwSize = sizeof(MIB_IFTABLE);
-    m_pIfTable = (MIB_IFTABLE*)malloc(m_dwSize);
-    int rtn;
-    rtn = GetIfTable(m_pIfTable, &m_dwSize, FALSE);
-    if (rtn == ERROR_INSUFFICIENT_BUFFER)	//如果函数返回值为ERROR_INSUFFICIENT_BUFFER，说明m_pIfTable的大小不够
+    int rtn{};
+    for (int retry = 0; retry < 8; retry++)
     {
+        m_pIfTable = (MIB_IFTABLE*)malloc(m_dwSize);
+        if (m_pIfTable == nullptr)
+            return;
+        DWORD size_before = m_dwSize;
+        rtn = GetIfTable(m_pIfTable, &m_dwSize, FALSE);
+        if (rtn != ERROR_INSUFFICIENT_BUFFER)       //成功
+            break;
         free(m_pIfTable);
-        m_pIfTable = (MIB_IFTABLE*)malloc(m_dwSize);	//用新的大小重新开辟一块内存
+        m_pIfTable = nullptr;
+        if (m_dwSize <= size_before)                //尺寸没有变化时强制翻倍，避免死循环
+            m_dwSize = size_before * 2;
     }
-    GetIfTable(m_pIfTable, &m_dwSize, FALSE);
+    if (rtn == ERROR_INSUFFICIENT_BUFFER || m_pIfTable == nullptr)      //仍失败则放弃本轮初始化，绝不使用容量不足的缓冲区
+        return;
 
     //获取当前所有的连接，并保存到m_connections容器中
     if (!theApp.m_general_data.show_all_interface)
@@ -1179,15 +1191,22 @@ void CTrafficMonitorDlg::DoMonitorAcquisition()
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             free(m_pIfTable);
+            m_pIfTable = nullptr;
             m_dwSize = sizeof(MIB_IFTABLE);
-            m_pIfTable = (MIB_IFTABLE*)malloc(m_dwSize);
-            rtn = GetIfTable(m_pIfTable, &m_dwSize, FALSE);
-            if (rtn == ERROR_INSUFFICIENT_BUFFER)	//如果函数返回值为ERROR_INSUFFICIENT_BUFFER，说明m_pIfTable的大小不够
+            for (int retry = 0; retry < 8; retry++)
             {
+                m_pIfTable = (MIB_IFTABLE*)malloc(m_dwSize);
+                if (m_pIfTable == nullptr)
+                    return;
+                DWORD size_before = m_dwSize;
+                rtn = GetIfTable(m_pIfTable, &m_dwSize, FALSE);
+                if (rtn != ERROR_INSUFFICIENT_BUFFER)       //成功
+                    break;
                 free(m_pIfTable);
-                m_pIfTable = (MIB_IFTABLE*)malloc(m_dwSize);	//用新的大小重新开辟一块内存
+                m_pIfTable = nullptr;
+                if (m_dwSize <= size_before)                //尺寸没有变化时强制翻倍，避免死循环
+                    m_dwSize = size_before * 2;
             }
-            GetIfTable(m_pIfTable, &m_dwSize, FALSE);
         }
     };
 

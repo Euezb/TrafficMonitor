@@ -87,6 +87,8 @@ void CAdapterCommon::GetIfTableInfo(vector<NetWorkConection>& adapters, MIB_IFTA
 			index = FindConnectionInIfTableFuzzy(adapters[i].description, pIfTable);
 		//if (index != -1)
 		//{
+		if (index < 0 || index >= static_cast<int>(pIfTable->dwNumEntries))	//越界保护：模糊匹配失败时 index 可能无效
+			continue;
 		adapters[i].index = index;
 		adapters[i].in_bytes = pIfTable->table[index].dwInOctets;
 		adapters[i].out_bytes = pIfTable->table[index].dwOutOctets;
