@@ -19,8 +19,81 @@ jobs:
     - name: Add msbuild to PATH
       uses: microsoft/setup-msbuild@v2
 
+    # 镜像里同时有 VS 18(2026) 和 VS 2022(17.x)：前者没有安装 MFC 库，
+    # 直接用会报 MSB8041。这里显式挑选带 VC.ATLMFC 组件的那套安装。
+    - name: Resolve msbuild (prefer the install that has MFC)
+      shell: pwsh
+      run: |
+        $diag = [System.Collections.Generic.List[string]]::new()
+        $diag.Add('## 构建环境诊断')
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        $diag.Add("- vswhere: $vswhere (存在: $(Test-Path $vswhere))")
+
+        $msbuild = $null
+        if (Test-Path $vswhere) {
+          $withMfc = @(& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.ATLMFC -property installationPath)
+          $diag.Add("- 装有 MFC(ATLMFC) 的 VS 安装: " + $(if ($withMfc.Count) { $withMfc -join ' | ' } else { '(无)' }))
+          $msbuild = (& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.ATLMFC -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1)
+          $diag.Add("- 从中解析到的 msbuild: $msbuild (存在: $(Test-Path $msbuild))")
+        }
+
+        if (-not $msbuild -or -not (Test-Path $msbuild)) {
+          $cmd = Get-Command msbuild -ErrorAction SilentlyContinue
+          $diag.Add("- 回退到 PATH 中的 msbuild: " + $(if ($cmd) { $cmd.Source } else { '(没有找到)' }))
+          if ($cmd) { $msbuild = $cmd.Source }
+        }
+
+        if ($msbuild -and (Test-Path $msbuild)) {
+          $diag.Add("- msbuild 版本: " + ((& $msbuild -version -nologo) -join ' '))
+        }
+        $diag.Add("- 解决方案文件存在: $(Test-Path TrafficMonitor.sln)")
+        $diag.Add("- 主工程文件存在: $(Test-Path TrafficMonitor\TrafficMonitor.vcxproj)")
+
+        $diag | ForEach-Object { Write-Host $_ }
+        $diag | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+        "MSBUILD_PATH=$msbuild" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+    # 直接构建 vcxproj（不走解决方案）：既避开 MSBuild 18 的
+    # TrafficMonitor.vcxproj.metaproj (MSB4025) 问题，也顺带跳过 PluginDemo。
+    # OutDir 显式指定，保证产物落在固定的 Bin\x64\Release (lite)\ 下。
     - name: Run msbuild
-      run: msbuild TrafficMonitor.sln -p:configuration="Release (lite)" -p:platform=x64 -p:platformToolset=v143
+      shell: pwsh
+      run: |
+        $msbuild = $env:MSBUILD_PATH
+        $log = 'build.log'
+        $outDir = Join-Path $env:GITHUB_WORKSPACE 'Bin\x64\Release (lite)\'
+        $proj = 'TrafficMonitor\TrafficMonitor.vcxproj'
+
+        "=== 策略 1: 直接构建主工程 (Release (lite)|x64) ===" | Out-File -Encoding utf8 $log
+        "输出目录: $outDir" | Out-File -Append -Encoding utf8 $log
+        & $msbuild $proj '-p:configuration=Release (lite)' -p:platform=x64 -p:platformToolset=v143 `
+            "-p:OutDir=$outDir" "-p:SolutionDir=$env:GITHUB_WORKSPACE\" -nologo -verbosity:normal 2>&1 |
+          Tee-Object -FilePath $log -Append
+        $code = $LASTEXITCODE
+        "策略 1 退出码 = $code" | Out-File -Append -Encoding utf8 $log
+
+        if ($code -ne 0) {
+          "=== 策略 2 回退: 走解决方案 + 只构建主工程 ===" | Out-File -Append -Encoding utf8 $log
+          & $msbuild TrafficMonitor.sln -t:TrafficMonitor '-p:configuration=Release (lite)' -p:platform=x64 -p:platformToolset=v143 -nologo -verbosity:normal 2>&1 |
+            Tee-Object -FilePath $log -Append
+          $code = $LASTEXITCODE
+          "策略 2 退出码 = $code" | Out-File -Append -Encoding utf8 $log
+        }
+
+        if ($code -ne 0) { exit $code }
+
+    - name: Publish build log (only on failure)
+      if: failure()
+      shell: pwsh
+      run: |
+        "## msbuild 输出（末尾 200 行）" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+        '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+        if (Test-Path build.log) {
+          Get-Content build.log -Tail 200 | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+        } else {
+          '(build.log 不存在，说明构建步骤未执行到写日志)' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+        }
+        '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
